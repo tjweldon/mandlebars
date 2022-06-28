@@ -205,18 +205,23 @@ func spawnWorkerPool(v *View, max int) [16]<-chan [3]int {
 }
 
 func DivergesWithin(c complex128, max int) *int {
-	r := cmplx.Abs(c - 0.25)
-	if r == 0 {
-		return nil
-	}
-	theta := math.Acos(real(c-0.25) / r)
-	if r < 0.5*(1-math.Cos(theta)) {
-		return nil
-	}
-
+	if args.Exponent == 2.0 {
+        r := cmplx.Abs(c - 0.25)
+        if r == 0 {
+            return nil
+        }
+        theta := math.Acos(real(c-0.25) / r)
+        if r < 0.5*(1-math.Cos(theta)) {
+            return nil
+        }
+    }
 	var z complex128
 	for n := 0; n < max; n++ {
-		z = z*z + c
+		if args.Exponent == 2.0 {
+            z = z*z + c
+        } else {
+            z = cmplx.Pow(z, complex(args.Exponent, 0)) + c
+        }
 		if cmplx.Abs(z) >= 2 {
 			return &n
 		}
@@ -233,11 +238,14 @@ func min(a, b int) int {
 }
 
 var args struct {
+    Exponent float64 `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
+    PixelWidth int `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
+    PixelHeight int `arg:"--pixel-height" default:"1080" help:"The number of rows of pixels"`
 	MaxIter    int     `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
 	CenterReal float64 `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
 	CenterImag float64 `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
 	Height     float64 `arg:"-h, --height" default:"2.0" help:"The height of the imaged region of the complex plane (not the resolution)."`
-	ColorFreq  float64 `arg:"-f, --freq" default:"2.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
+	ColorFreq  float64 `arg:"-f, --freq" default:"1.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
 	HueOffset  float64 `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
 	AlphaDecay float64 `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
 }
@@ -246,8 +254,8 @@ func main() {
 	arg.MustParse(&args)
 	v := NewView(
 		image.Point{
-			X: 3440 * 2,
-			Y: 1440 * 2,
+			X: args.PixelWidth,
+			Y: args.PixelHeight,
 		},
 		args.Height,
 		complex(args.CenterReal, args.CenterImag),
