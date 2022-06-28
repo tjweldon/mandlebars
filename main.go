@@ -110,7 +110,7 @@ func Pallette(n int) color.Color {
 	}
 
 	phaseIncrement := 2.0 * math.Pi / 3
-	angularSpeed := 2.0 * math.Pi / 18.0
+    angularSpeed := 2.0 * math.Pi / (args.ColorFreq*18.0)
 	baseOffset := 0.0
 	phases := [3]float64{
 		baseOffset,
@@ -163,6 +163,10 @@ func worker(vals <-chan complex128, points <-chan image.Point, v *View, start, s
 
 var args struct {
 	MaxIter int `arg:"positional"`
+    CenterReal float64 `arg:"-r, --center-real" default:"-1.0"`
+    CenterImag float64 `arg:"-i, --center-imag" default:"0.0"`
+    Height float64 `arg:"-h, --height" default:"2.0"`
+    ColorFreq float64 `arg:"-f, --freq" default:"2.0"`
 }
 
 func main() {
@@ -172,9 +176,9 @@ func main() {
 			X: 3440 * 2,
 			Y: 1440 * 2,
 		},
-		0.8,
-		complex(-1, -0.4),
-	)
+		args.Height,
+		complex(args.CenterReal, args.CenterImag),
+    )
 	img := image.NewRGBA(image.Rect(0, 0, v.Resolution.X, v.Resolution.Y))
 
 	max := args.MaxIter
