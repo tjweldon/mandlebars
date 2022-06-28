@@ -110,8 +110,8 @@ func Pallette(n int) color.Color {
 	}
 
 	phaseIncrement := 2.0 * math.Pi / 3
-    angularSpeed := 2.0 * math.Pi / (args.ColorFreq*18.0)
-	baseOffset := 0.0
+	angularSpeed := args.ColorFreq * 2.0 * math.Pi / 18.0
+	baseOffset := 0.0 + args.HueOffset*2.0*math.Pi
 	phases := [3]float64{
 		baseOffset,
 		baseOffset + phaseIncrement,
@@ -122,7 +122,7 @@ func Pallette(n int) color.Color {
 		R: byte(40 + 215*math.Pow(math.Cos(t+phases[0]), 2.0)),
 		G: byte(40 + 215*math.Pow(math.Cos(t+phases[1]), 2.0)),
 		B: byte(40 + 215*math.Pow(math.Cos(t+phases[2]), 2.0)),
-		A: 255,
+		A: byte(255.0 * math.Pow(args.AlphaDecay, float64(n))),
 	}
 }
 
@@ -159,35 +159,6 @@ func worker(vals <-chan complex128, points <-chan image.Point, v *View, start, s
 	ch := make(chan [3]int, 128)
 	go work(ch)
 	return ch
-}
-
-var args struct {
-	MaxIter int `arg:"positional"`
-    CenterReal float64 `arg:"-r, --center-real" default:"-1.0"`
-    CenterImag float64 `arg:"-i, --center-imag" default:"0.0"`
-    Height float64 `arg:"-h, --height" default:"2.0"`
-    ColorFreq float64 `arg:"-f, --freq" default:"2.0"`
-}
-
-func main() {
-	arg.MustParse(&args)
-	v := NewView(
-		image.Point{
-			X: 3440 * 2,
-			Y: 1440 * 2,
-		},
-		args.Height,
-		complex(args.CenterReal, args.CenterImag),
-    )
-	img := image.NewRGBA(image.Rect(0, 0, v.Resolution.X, v.Resolution.Y))
-
-	max := args.MaxIter
-	resultChans := spawnWorkerPool(v, max)
-
-	setPixels(resultChans, img, v)
-
-	f, _ := os.Create("image.png")
-	png.Encode(f, img)
 }
 
 func setPixels(resultChans [16]<-chan [3]int, img *image.RGBA, v *View) {
@@ -259,4 +230,40 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+var args struct {
+	MaxIter    int     `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
+	CenterReal float64 `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
+	CenterImag float64 `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
+	Height     float64 `arg:"-h, --height" default:"2.0" help:"The height of the imaged region of the complex plane (not the resolution)."`
+	ColorFreq  float64 `arg:"-f, --freq" default:"2.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
+	HueOffset  float64 `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
+	AlphaDecay float64 `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
+}
+
+func main() {
+	arg.MustParse(&args)
+	v := NewView(
+		image.Point{
+			X: 3440 * 2,
+			Y: 1440 * 2,
+		},
+		args.Height,
+		complex(args.CenterReal, args.CenterImag),
+	)
+	img := image.NewRGBA(image.Rect(0, 0, v.Resolution.X, v.Resolution.Y))
+	for x := 0; x < v.Resolution.X; x++ {
+		for y := 0; y < v.Resolution.Y; y++ {
+			img.Set(x, y, color.Black)
+		}
+	}
+
+	max := args.MaxIter
+	resultChans := spawnWorkerPool(v, max)
+
+	setPixels(resultChans, img, v)
+
+	f, _ := os.Create("image.png")
+	png.Encode(f, img)
 }
