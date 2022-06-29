@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/cmplx"
 	"os"
+	"reflect"
 )
 
 type Side int
@@ -64,7 +65,11 @@ func (v *View) width() float64 {
 	return v.Aspect * v.Height
 }
 
-func (v *View) SampleVals(rowStart, rowStop int) (<-chan complex128, <-chan image.Point) {
+func (v *View) Samples(rowStart, rowStop int) <-chan complex128 {
+	totalOffset := v.Offsets[Top] +
+		v.Offsets[Left] +
+		v.Offsets[Sample] +
+		v.Centre
 	genSamples := func(out chan<- complex128) {
 		sep := complex(
 			v.Width/float64(v.Resolution.X),
@@ -75,16 +80,19 @@ func (v *View) SampleVals(rowStart, rowStop int) (<-chan complex128, <-chan imag
 				out <- complex(
 					real(sep)*float64(x),
 					imag(sep)*float64(y),
-				) +
-					v.Offsets[Top] +
-					v.Offsets[Left] +
-					v.Offsets[Sample] +
-					v.Centre
+				) + totalOffset
 			}
 		}
 		close(out)
 	}
 
+	samples := make(chan complex128)
+	go genSamples(samples)
+
+	return samples
+}
+
+func (v *View) Points(rowStart int, rowStop int) chan image.Point {
 	genPixels := func(out chan<- image.Point) {
 		for y := rowStart; y < min(v.Resolution.Y, rowStop); y++ {
 			for x := 0; x < v.Resolution.X; x++ {
@@ -94,11 +102,14 @@ func (v *View) SampleVals(rowStart, rowStop int) (<-chan complex128, <-chan imag
 
 		close(out)
 	}
-
-	samples := make(chan complex128)
 	pixels := make(chan image.Point)
-	go genSamples(samples)
 	go genPixels(pixels)
+	return pixels
+}
+
+func (v *View) SamplePoints(rowStart, rowStop int) (<-chan complex128, <-chan image.Point) {
+	samples := v.Samples(rowStart, rowStop)
+	pixels := v.Points(rowStart, rowStop)
 
 	return samples, pixels
 }
@@ -107,14 +118,23 @@ func (v *View) Index(p image.Point) int {
 	return p.X + v.Resolution.X*p.Y
 }
 
-func Palette(n int) color.Color {
+const OneThird = 2.0 * math.Pi / 3
+
+type PaletteConf struct {
+	PhaseIncrement float64
+	ColorFreq      float64
+	HueOffset      float64
+	AlphaDecay     float64
+}
+
+func (p PaletteConf) palette(n int) color.Color {
 	if n == -1 {
 		return color.Black
 	}
 
-	phaseIncrement := 2.0 * math.Pi / 3
-	angularSpeed := args.ColorFreq * 2.0 * math.Pi / 18.0
-	baseOffset := 0.0 + args.HueOffset*2.0*math.Pi
+	phaseIncrement := p.PhaseIncrement
+	angularSpeed := p.ColorFreq * 2.0 * math.Pi / 18.0
+	baseOffset := 0.0 + p.HueOffset*2.0*math.Pi
 	phases := [3]float64{
 		baseOffset,
 		baseOffset + phaseIncrement,
@@ -125,10 +145,24 @@ func Palette(n int) color.Color {
 		R: byte(40 + 215*math.Pow(math.Cos(t+phases[0]), 2.0)),
 		G: byte(40 + 215*math.Pow(math.Cos(t+phases[1]), 2.0)),
 		B: byte(40 + 215*math.Pow(math.Cos(t+phases[2]), 2.0)),
-		A: byte(255.0 * math.Pow(args.AlphaDecay, float64(n))),
+		A: byte(255.0 * math.Pow(p.AlphaDecay, float64(n))),
 	}
 }
 
+// MakePalette takes the values configured in PaletteConf and returns
+// a Palette function that closes around them
+func (p PaletteConf) MakePalette() func(n int) color.Color {
+	return p.palette
+}
+
+// Palette is the global colour Palette function
+var Palette = func(n int) color.Color {
+	return color.Black
+}
+
+// WorkerCount is the number of separate goroutines
+// that are each given a roughly equal chunk of the image
+// to render
 type WorkerCount int
 
 const (
@@ -136,24 +170,34 @@ const (
 	Two
 	Four
 	Eight
+
+	// Sixteen is probably too aggressive if you care about your machine
 	Sixteen
 	ThirtyTwo
 )
 
-const workerCount = Eight + Four
+// workerCount is the number of rows to split the image into
+// feel free to change this appropriately for your system.
+// Set to Eight by default
+const workerCount = Eight
 
-func worker(vals <-chan complex128, points <-chan image.Point, max int) <-chan [3]int {
+const workerFail = -1
+
+// RunWorker launches the goroutine that checks pixel by pixel, how many iterations it takes
+// before the series diverges. If it reaches args.MaxIter then it represents this as -1
+// which is rendered black by default.
+func RunWorker(vals <-chan complex128, points <-chan image.Point, max int) <-chan [3]int {
 	work := func(result chan<- [3]int) {
 		for point := range points {
 			sample, ok := <-vals
 			if !ok {
 				break
 			}
-			optN := DivergesWithin(sample, max)
+			optN := DivergesWithin(sample, max, args.Exponent)
 			if optN != nil {
 				result <- [3]int{point.X, point.Y, *optN}
 			} else {
-				result <- [3]int{point.X, point.Y, -1}
+				result <- [3]int{point.X, point.Y, workerFail}
 			}
 		}
 		close(result)
@@ -164,18 +208,23 @@ func worker(vals <-chan complex128, points <-chan image.Point, max int) <-chan [
 	return ch
 }
 
-func setPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *View) {
+// SetPixels collects the sample escape times and pixel locations from their respective generators and sets them in the image object
+func (v *View) SetPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA) {
+	// closed stores whether each worker has closed their channel
 	var closed [workerCount]bool
 	closedCount, pixCount := 0, 0
 	for closedCount < int(workerCount) {
 		closedCount = 0
 		for i, rc := range resultChans {
+			// count the workers whose return channels are open
 			if closed[i] {
 				closedCount++
 				if closedCount == int(workerCount) {
 					break
 				}
 			}
+
+			// iterate over channels, non-blocking.
 			select {
 			case pix, open := <-rc:
 				if !open {
@@ -186,6 +235,8 @@ func setPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *View)
 				}
 			default:
 			}
+
+			// print percent completion once per row's worth of pixels
 			if (pixCount+1)%v.Resolution.X == 0 {
 				fmt.Printf("%05.2f%%\r", float64(100*pixCount)/float64(v.SampleCount()))
 			}
@@ -196,19 +247,19 @@ func setPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *View)
 	fmt.Println("Done generating")
 }
 
-func spawnWorkerPool(v *View, max int) [workerCount]<-chan [3]int {
+func StartWork(v *View, max int) [workerCount]<-chan [3]int {
 	resultChans := [workerCount]<-chan [3]int{}
 	for workers := 1; workers <= int(workerCount); workers++ {
 		step := v.Resolution.Y / int(workerCount)
 		start, stop := step*(workers-1), step*workers
-		vals, points := v.SampleVals(start, stop)
-		resultChans[workers-1] = worker(vals, points, max)
+		vals, points := v.SamplePoints(start, stop)
+		resultChans[workers-1] = RunWorker(vals, points, max)
 	}
 	return resultChans
 }
 
-// DivergesWithin is the
-func DivergesWithin(c complex128, max int) *int {
+// DivergesWithin is the function
+func DivergesWithin(c complex128, max int, exponent float64) *int {
 	if args.Exponent == 2.0 {
 		r := cmplx.Abs(c - 0.25)
 		if r == 0 {
@@ -221,10 +272,10 @@ func DivergesWithin(c complex128, max int) *int {
 	}
 	var z complex128
 	for n := 0; n < max; n++ {
-		if args.Exponent == 2.0 {
+		if exponent == 2.0 {
 			z = z*z + c
 		} else {
-			z = cmplx.Pow(z, complex(args.Exponent, 0)) + c
+			z = cmplx.Pow(z, complex(exponent, 0)) + c
 		}
 		if cmplx.Abs(z) >= 2 {
 			return &n
@@ -241,9 +292,12 @@ func min(a, b int) int {
 	return b
 }
 
-type Load struct {
-	Path string `arg:"positional"`
+type ioSubcommand struct {
+	Path string `arg:"positional" help:"The path to the arg spec json file"`
 }
+
+// Load is the subCommand that loads an arg spec
+type Load ioSubcommand
 
 func (l *Load) Run() error {
 
@@ -263,9 +317,8 @@ func (l *Load) Run() error {
 	return nil
 }
 
-var parseBypass = false
-
-type Dump Load
+// Dump is the ioSubcommand that dumps the arg spec as json
+type Dump ioSubcommand
 
 func (d *Dump) Run() error {
 	args.Dump, args.Load = nil, nil
@@ -276,6 +329,7 @@ func (d *Dump) Run() error {
 	}
 	defer file.Close()
 
+	fmt.Println(reflect.TypeOf(args))
 	specBytes, err := json.MarshalIndent(args, "", "  ")
 	var n int
 	n, err = file.Write(specBytes)
@@ -286,38 +340,35 @@ func (d *Dump) Run() error {
 	return nil
 }
 
-type ArgSpec struct {
-	Exponent    float64
-	PixelWidth  int
-	PixelHeight int
-	MaxIter     int
-	CenterReal  float64
-	CenterImag  float64
-	Height      float64
-	ColorFreq   float64
-	HueOffset   float64
-	AlphaDecay  float64
-	Load        *Load `json:"-"`
-	Dump        *Dump `json:"-"`
-}
-
-var args struct {
-	Exponent    float64 `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
+type Cli struct {
+	MaxIter     int     `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
 	PixelWidth  int     `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
 	PixelHeight int     `arg:"--pixel-height" default:"1080" help:"The number of rows of pixels"`
-	MaxIter     int     `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
+	Exponent    float64 `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
 	CenterReal  float64 `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
 	CenterImag  float64 `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
 	Height      float64 `arg:"-h, --height" default:"2.0" help:"The height of the imaged region of the complex plane (not the resolution)."`
 	ColorFreq   float64 `arg:"-f, --freq" default:"1.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
 	HueOffset   float64 `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
 	AlphaDecay  float64 `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
-	Load        *Load   `arg:"subcommand:load"`
-	Dump        *Dump   `arg:"subcommand:dump" help:"Dump an image spec.json to path"`
+	Load        *Load   `arg:"subcommand:load" help:"Load image spec json from path" json:"-"`
+	Dump        *Dump   `arg:"subcommand:dump" help:"Dump options to arg spec json file. Dumps defaults if no options are set" json:"-"`
 }
 
+func (c Cli) Palette() func(n int) color.Color {
+	return PaletteConf{
+		PhaseIncrement: OneThird,
+		ColorFreq:      c.ColorFreq,
+		HueOffset:      c.HueOffset,
+		AlphaDecay:     c.AlphaDecay,
+	}.MakePalette()
+}
+
+var args Cli
+
 func main() {
-	maybeParse()
+	arg.MustParse(&args)
+	Palette = args.Palette()
 	var err error
 	switch {
 	case args.Dump != nil:
@@ -350,9 +401,9 @@ func main() {
 	}
 
 	max := args.MaxIter
-	resultChans := spawnWorkerPool(v, max)
+	resultChans := StartWork(v, max)
 
-	setPixels(resultChans, img, v)
+	v.SetPixels(resultChans, img)
 
 	f, _ := os.Create("image.png")
 	err = png.Encode(f, img)
@@ -361,10 +412,4 @@ func main() {
 	}
 
 	log.Println("Done")
-}
-
-func maybeParse() {
-	if !parseBypass {
-		arg.MustParse(&args)
-	}
 }

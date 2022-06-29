@@ -4,7 +4,7 @@ A fractal generator that doubles as a total conversion mod to turn your computer
 
 ## Usage
 
-```
+```bash
 Usage: main [--exp EXP] [--pixel-width PIXEL-WIDTH] [--pixel-height PIXEL-HEIGHT] [--iter ITER] [--center-real CENTER-REAL] [--center-imag CENTER-IMAG] [--height HEIGHT] [--freq FREQ] [--hue HUE] [--alpha-decay ALPHA-DECAY]
 
 Options:
