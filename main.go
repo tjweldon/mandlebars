@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/alexflint/go-arg"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
+	"log"
 	"math"
 	"math/cmplx"
 	"os"
@@ -104,7 +107,7 @@ func (v *View) Index(p image.Point) int {
 	return p.X + v.Resolution.X*p.Y
 }
 
-func Pallette(n int) color.Color {
+func Palette(n int) color.Color {
 	if n == -1 {
 		return color.Black
 	}
@@ -137,9 +140,9 @@ const (
 	ThirtyTwo
 )
 
-const workerCount = Sixteen
+const workerCount = Eight + Four
 
-func worker(vals <-chan complex128, points <-chan image.Point, v *View, start, stop, max int) <-chan [3]int {
+func worker(vals <-chan complex128, points <-chan image.Point, max int) <-chan [3]int {
 	work := func(result chan<- [3]int) {
 		for point := range points {
 			sample, ok := <-vals
@@ -161,7 +164,7 @@ func worker(vals <-chan complex128, points <-chan image.Point, v *View, start, s
 	return ch
 }
 
-func setPixels(resultChans [16]<-chan [3]int, img *image.RGBA, v *View) {
+func setPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *View) {
 	var closed [workerCount]bool
 	closedCount, pixCount := 0, 0
 	for closedCount < int(workerCount) {
@@ -178,7 +181,7 @@ func setPixels(resultChans [16]<-chan [3]int, img *image.RGBA, v *View) {
 				if !open {
 					closed[i] = true
 				} else {
-					img.Set(pix[0], pix[1], Pallette(pix[2]))
+					img.Set(pix[0], pix[1], Palette(pix[2]))
 					pixCount++
 				}
 			default:
@@ -193,17 +196,18 @@ func setPixels(resultChans [16]<-chan [3]int, img *image.RGBA, v *View) {
 	fmt.Println("Done generating")
 }
 
-func spawnWorkerPool(v *View, max int) [16]<-chan [3]int {
+func spawnWorkerPool(v *View, max int) [workerCount]<-chan [3]int {
 	resultChans := [workerCount]<-chan [3]int{}
 	for workers := 1; workers <= int(workerCount); workers++ {
 		step := v.Resolution.Y / int(workerCount)
 		start, stop := step*(workers-1), step*workers
 		vals, points := v.SampleVals(start, stop)
-		resultChans[workers-1] = worker(vals, points, v, start, stop, max)
+		resultChans[workers-1] = worker(vals, points, max)
 	}
 	return resultChans
 }
 
+// DivergesWithin is the
 func DivergesWithin(c complex128, max int) *int {
 	if args.Exponent == 2.0 {
 		r := cmplx.Abs(c - 0.25)
@@ -237,6 +241,66 @@ func min(a, b int) int {
 	return b
 }
 
+type Load struct {
+	Path string `arg:"positional"`
+}
+
+func (l *Load) Run() error {
+
+	file, err := os.Open(l.Path)
+	if err != nil {
+		return err
+	}
+	argBytes, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = json.Unmarshal(argBytes, &args)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+var parseBypass = false
+
+type Dump Load
+
+func (d *Dump) Run() error {
+	args.Dump, args.Load = nil, nil
+
+	file, err := os.OpenFile(d.Path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	specBytes, err := json.MarshalIndent(args, "", "  ")
+	var n int
+	n, err = file.Write(specBytes)
+	fmt.Println(n, " bytes")
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type ArgSpec struct {
+	Exponent    float64
+	PixelWidth  int
+	PixelHeight int
+	MaxIter     int
+	CenterReal  float64
+	CenterImag  float64
+	Height      float64
+	ColorFreq   float64
+	HueOffset   float64
+	AlphaDecay  float64
+	Load        *Load `json:"-"`
+	Dump        *Dump `json:"-"`
+}
+
 var args struct {
 	Exponent    float64 `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
 	PixelWidth  int     `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
@@ -248,10 +312,28 @@ var args struct {
 	ColorFreq   float64 `arg:"-f, --freq" default:"1.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
 	HueOffset   float64 `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
 	AlphaDecay  float64 `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
+	Load        *Load   `arg:"subcommand:load"`
+	Dump        *Dump   `arg:"subcommand:dump" help:"Dump an image spec.json to path"`
 }
 
 func main() {
-	arg.MustParse(&args)
+	maybeParse()
+	var err error
+	switch {
+	case args.Dump != nil:
+		log.Println("Dumping...")
+		err = args.Dump.Run()
+		log.Println("Done")
+		return
+	case args.Load != nil:
+		log.Println("Loading")
+		err = args.Load.Run()
+	}
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	v := NewView(
 		image.Point{
 			X: args.PixelWidth,
@@ -273,5 +355,16 @@ func main() {
 	setPixels(resultChans, img, v)
 
 	f, _ := os.Create("image.png")
-	png.Encode(f, img)
+	err = png.Encode(f, img)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("Done")
+}
+
+func maybeParse() {
+	if !parseBypass {
+		arg.MustParse(&args)
+	}
 }
