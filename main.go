@@ -391,7 +391,6 @@ func main() {
 		log.Println("Loading")
 		err = args.Load.Run()
 	}
-
 	if args.OutFile != nil {
 		err = args.OutFile.Run()
 	}
