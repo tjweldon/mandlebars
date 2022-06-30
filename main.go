@@ -15,7 +15,6 @@ import (
 	"math/cmplx"
 	"os"
 	"os/exec"
-	"reflect"
 )
 
 // Palette is the global colour Palette function
@@ -110,15 +109,17 @@ func SetPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *view.
 			default:
 			}
 
-			// print percent completion once per row's worth of pixels
-			if (pixCount+1)%v.Resolution.X == 0 {
+			// print percent completion once per row's worth of pixels if not in stdout mode
+			if !args.StdOut && (pixCount+1)%v.Resolution.X == 0 {
 				fmt.Printf("%05.2f%%\r", float64(100*pixCount)/float64(v.SampleCount()))
 			}
 		}
 	}
 
-	fmt.Println()
-	fmt.Println("Done generating")
+	if !args.StdOut {
+		fmt.Println()
+		fmt.Println("Done generating")
+	}
 }
 
 // DivergesWithin is the function
@@ -185,7 +186,6 @@ func (d *Dump) Run() error {
 	}
 	defer file.Close()
 
-	fmt.Println(reflect.TypeOf(args))
 	specBytes, err := json.MarshalIndent(args, "", "  ")
 	var n int
 	n, err = file.Write(specBytes)
@@ -219,9 +219,11 @@ type Cli struct {
 	Load        *Load    `arg:"subcommand:load" help:"Load image spec json from path" json:"-"`
 	Dump        *Dump    `arg:"subcommand:dump" help:"Dump options to arg spec json file. Dumps defaults if no options are set" json:"-"`
 	OutFile     *OutFile `arg:"subcommand:to" help:"Saves the image to the specified path" json:"-"`
+	StdOut      bool     `arg:"--stdout" help:"The image data will be output to stdout" json:"-"`
 }
 
 func (c Cli) Palette() func(n int) color.Color {
+
 	return palette.PaletteConf{
 		PhaseIncrement: palette.OneThird,
 		ColorFreq:      c.ColorFreq,
@@ -257,9 +259,26 @@ func GenerateImage(path string) *view.View {
 
 	SetPixels(resultChans, img, v)
 
-	f, _ := os.Create(path)
-	err := png.Encode(f, img)
+	var (
+		f   io.WriteCloser
+		err error
+	)
+
+	if args.StdOut {
+		f = os.Stdout
+	} else {
+		f, err = os.Create(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	err = png.Encode(f, img)
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := f.Close(); err != nil {
 		log.Fatal(err)
 	}
 
