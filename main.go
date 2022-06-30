@@ -293,7 +293,7 @@ func min(a, b int) int {
 }
 
 type ioSubcommand struct {
-	Path string `arg:"positional" help:"The path to the arg spec json file"`
+	Path string `arg:"positional" help:"The path to the file"`
 }
 
 // Load is the subCommand that loads an arg spec
@@ -340,19 +340,28 @@ func (d *Dump) Run() error {
 	return nil
 }
 
+// OutFile lets you put the image file where you want it
+type OutFile ioSubcommand
+
+func (o *OutFile) Run() error {
+	dst = o.Path
+	return nil
+}
+
 type Cli struct {
-	MaxIter     int     `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
-	PixelWidth  int     `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
-	PixelHeight int     `arg:"--pixel-height" default:"1080" help:"The number of rows of pixels"`
-	Exponent    float64 `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
-	CenterReal  float64 `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
-	CenterImag  float64 `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
-	Height      float64 `arg:"-h, --height" default:"2.0" help:"The height of the imaged region of the complex plane (not the resolution)."`
-	ColorFreq   float64 `arg:"-f, --freq" default:"1.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
-	HueOffset   float64 `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
-	AlphaDecay  float64 `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
-	Load        *Load   `arg:"subcommand:load" help:"Load image spec json from path" json:"-"`
-	Dump        *Dump   `arg:"subcommand:dump" help:"Dump options to arg spec json file. Dumps defaults if no options are set" json:"-"`
+	MaxIter     int      `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
+	PixelWidth  int      `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
+	PixelHeight int      `arg:"--pixel-height" default:"1080" help:"The number of rows of pixels"`
+	Exponent    float64  `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
+	CenterReal  float64  `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
+	CenterImag  float64  `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
+	Height      float64  `arg:"-h, --height" default:"2.0" help:"The height of the imaged region of the complex plane (not the resolution)."`
+	ColorFreq   float64  `arg:"-f, --freq" default:"1.0" help:"How fast the hue varies, a smaller value means more uniform colour, more iterations means more variation close to the boundary."`
+	HueOffset   float64  `arg:"--hue" default:"0.0" help:"The absolute hue offset. This is periodic such that --hue=1 and --hue=0 are the same."`
+	AlphaDecay  float64  `arg:"--alpha-decay" default:"1.0" help:"A value between 0 and 1, where 0.5 means that the nth colour has (0.5)^n times 100% alpha. i.e. the colours fade close to the boundary. A value of 1 is no decay."`
+	Load        *Load    `arg:"subcommand:load" help:"Load image spec json from path" json:"-"`
+	Dump        *Dump    `arg:"subcommand:dump" help:"Dump options to arg spec json file. Dumps defaults if no options are set" json:"-"`
+	OutFile     *OutFile `arg:"subcommand:to" help:"Saves the image to the specified path" json:"-"`
 }
 
 func (c Cli) Palette() func(n int) color.Color {
@@ -365,6 +374,8 @@ func (c Cli) Palette() func(n int) color.Color {
 }
 
 var args Cli
+
+var dst = "./image.png"
 
 func main() {
 	arg.MustParse(&args)
@@ -381,10 +392,18 @@ func main() {
 		err = args.Load.Run()
 	}
 
+	if args.OutFile != nil {
+		err = args.OutFile.Run()
+	}
+
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	GenerateImage(dst)
+}
+
+func GenerateImage(path string) {
 	v := NewView(
 		image.Point{
 			X: args.PixelWidth,
@@ -405,8 +424,8 @@ func main() {
 
 	v.SetPixels(resultChans, img)
 
-	f, _ := os.Create("image.png")
-	err = png.Encode(f, img)
+	f, _ := os.Create(path)
+	err := png.Encode(f, img)
 	if err != nil {
 		log.Fatal(err)
 	}
