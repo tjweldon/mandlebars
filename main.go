@@ -9,151 +9,14 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"mandlebar/src/palette"
+	"mandlebar/src/view"
 	"math"
 	"math/cmplx"
 	"os"
+	"os/exec"
 	"reflect"
 )
-
-type Side int
-
-const (
-	Top Side = iota
-	Right
-	Bottom
-	Left
-	Sample
-)
-
-type SideOffsets [5]complex128
-
-type View struct {
-	Resolution            image.Point
-	Height, Width, Aspect float64
-	Centre                complex128
-	Offsets               SideOffsets
-}
-
-func NewView(resolution image.Point, height float64, centre complex128) *View {
-	v := &View{
-		Resolution: resolution,
-		Height:     height,
-		Centre:     centre,
-	}
-	v.Aspect = v.aspect()
-	v.Width = v.width()
-	v.Offsets = SideOffsets{
-		Top:    complex(0.0, v.Height/2.0),
-		Right:  complex(v.Width/2.0, 0.0),
-		Bottom: complex(0.0, -v.Height/2.0),
-		Left:   complex(-v.Width/2.0, 0.0),
-		Sample: complex(v.Width/float64(2*v.Resolution.X), v.Height/float64(2*v.Resolution.Y)),
-	}
-
-	return v
-}
-
-func (v View) SampleCount() int {
-	return v.Resolution.X * v.Resolution.Y
-}
-
-func (v *View) aspect() float64 {
-	return float64(v.Resolution.X) / float64(v.Resolution.Y)
-}
-
-func (v *View) width() float64 {
-	return v.Aspect * v.Height
-}
-
-func (v *View) Samples(rowStart, rowStop int) <-chan complex128 {
-	totalOffset := v.Offsets[Top] +
-		v.Offsets[Left] +
-		v.Offsets[Sample] +
-		v.Centre
-	genSamples := func(out chan<- complex128) {
-		sep := complex(
-			v.Width/float64(v.Resolution.X),
-			-v.Height/float64(v.Resolution.Y),
-		)
-		for y := rowStart; y < min(v.Resolution.Y, rowStop); y++ {
-			for x := 0; x < v.Resolution.X; x++ {
-				out <- complex(
-					real(sep)*float64(x),
-					imag(sep)*float64(y),
-				) + totalOffset
-			}
-		}
-		close(out)
-	}
-
-	samples := make(chan complex128)
-	go genSamples(samples)
-
-	return samples
-}
-
-func (v *View) Points(rowStart int, rowStop int) chan image.Point {
-	genPixels := func(out chan<- image.Point) {
-		for y := rowStart; y < min(v.Resolution.Y, rowStop); y++ {
-			for x := 0; x < v.Resolution.X; x++ {
-				out <- image.Point{X: x, Y: y}
-			}
-		}
-
-		close(out)
-	}
-	pixels := make(chan image.Point)
-	go genPixels(pixels)
-	return pixels
-}
-
-func (v *View) SamplePoints(rowStart, rowStop int) (<-chan complex128, <-chan image.Point) {
-	samples := v.Samples(rowStart, rowStop)
-	pixels := v.Points(rowStart, rowStop)
-
-	return samples, pixels
-}
-
-func (v *View) Index(p image.Point) int {
-	return p.X + v.Resolution.X*p.Y
-}
-
-const OneThird = 2.0 * math.Pi / 3
-
-type PaletteConf struct {
-	PhaseIncrement float64
-	ColorFreq      float64
-	HueOffset      float64
-	AlphaDecay     float64
-}
-
-func (p PaletteConf) palette(n int) color.Color {
-	if n == -1 {
-		return color.Black
-	}
-
-	phaseIncrement := p.PhaseIncrement
-	angularSpeed := p.ColorFreq * 2.0 * math.Pi / 18.0
-	baseOffset := 0.0 + p.HueOffset*2.0*math.Pi
-	phases := [3]float64{
-		baseOffset,
-		baseOffset + phaseIncrement,
-		baseOffset + 2*phaseIncrement,
-	}
-	t := angularSpeed * float64(n)
-	return color.RGBA{
-		R: byte(40 + 215*math.Pow(math.Cos(t+phases[0]), 2.0)),
-		G: byte(40 + 215*math.Pow(math.Cos(t+phases[1]), 2.0)),
-		B: byte(40 + 215*math.Pow(math.Cos(t+phases[2]), 2.0)),
-		A: byte(255.0 * math.Pow(p.AlphaDecay, float64(n))),
-	}
-}
-
-// MakePalette takes the values configured in PaletteConf and returns
-// a Palette function that closes around them
-func (p PaletteConf) MakePalette() func(n int) color.Color {
-	return p.palette
-}
 
 // Palette is the global colour Palette function
 var Palette = func(n int) color.Color {
@@ -208,8 +71,19 @@ func RunWorker(vals <-chan complex128, points <-chan image.Point, max int) <-cha
 	return ch
 }
 
+func StartWork(v *view.View, max int) [workerCount]<-chan [3]int {
+	resultChans := [workerCount]<-chan [3]int{}
+	for workers := 1; workers <= int(workerCount); workers++ {
+		step := v.Resolution.Y / int(workerCount)
+		start, stop := step*(workers-1), step*workers
+		vals, points := v.SamplePoints(start, stop)
+		resultChans[workers-1] = RunWorker(vals, points, max)
+	}
+	return resultChans
+}
+
 // SetPixels collects the sample escape times and pixel locations from their respective generators and sets them in the image object
-func (v *View) SetPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA) {
+func SetPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA, v *view.View) {
 	// closed stores whether each worker has closed their channel
 	var closed [workerCount]bool
 	closedCount, pixCount := 0, 0
@@ -247,17 +121,6 @@ func (v *View) SetPixels(resultChans [workerCount]<-chan [3]int, img *image.RGBA
 	fmt.Println("Done generating")
 }
 
-func StartWork(v *View, max int) [workerCount]<-chan [3]int {
-	resultChans := [workerCount]<-chan [3]int{}
-	for workers := 1; workers <= int(workerCount); workers++ {
-		step := v.Resolution.Y / int(workerCount)
-		start, stop := step*(workers-1), step*workers
-		vals, points := v.SamplePoints(start, stop)
-		resultChans[workers-1] = RunWorker(vals, points, max)
-	}
-	return resultChans
-}
-
 // DivergesWithin is the function
 func DivergesWithin(c complex128, max int, exponent float64) *int {
 	if args.Exponent == 2.0 {
@@ -283,13 +146,6 @@ func DivergesWithin(c complex128, max int, exponent float64) *int {
 	}
 
 	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 type ioSubcommand struct {
@@ -352,6 +208,7 @@ type Cli struct {
 	MaxIter     int      `arg:"--iter" default:"64" help:"The number of iterations to apply z -> z^2 + c. The actual number of iterations for a pixel is at most this value, less if it doesn't come out black."`
 	PixelWidth  int      `arg:"--pixel-width" default:"1920" help:"The number of pixels per row"`
 	PixelHeight int      `arg:"--pixel-height" default:"1080" help:"The number of rows of pixels"`
+	Display     int      `arg:"--display-height" default:"-1" help:"Uses goiv to display an image" json:"-"`
 	Exponent    float64  `arg:"--exp" default:"2" help:"The mandlebrot set has exponent 2 (i.e. x -> z^2 + c) but we can try others!"`
 	CenterReal  float64  `arg:"-r, --center-real" default:"-1.0" help:"The real (x axis) part of the complex number corresponding to the centre of the image"`
 	CenterImag  float64  `arg:"-i, --center-imag" default:"0.0" help:"The imaginary (y axis) part of the complex number corresponding to the centre of the image"`
@@ -365,8 +222,8 @@ type Cli struct {
 }
 
 func (c Cli) Palette() func(n int) color.Color {
-	return PaletteConf{
-		PhaseIncrement: OneThird,
+	return palette.PaletteConf{
+		PhaseIncrement: palette.OneThird,
 		ColorFreq:      c.ColorFreq,
 		HueOffset:      c.HueOffset,
 		AlphaDecay:     c.AlphaDecay,
@@ -375,7 +232,39 @@ func (c Cli) Palette() func(n int) color.Color {
 
 var args Cli
 
-var dst = "./image.png"
+var dst = "./mandle.png"
+
+// GenerateImage sets up the view.View, spawns the workers and then supplies the result
+// channels to SetPixels. The image is then written the supplied path
+func GenerateImage(path string) *view.View {
+	v := view.NewView(
+		image.Point{
+			X: args.PixelWidth,
+			Y: args.PixelHeight,
+		},
+		args.Height,
+		complex(args.CenterReal, args.CenterImag),
+	)
+	img := image.NewRGBA(image.Rect(0, 0, v.Resolution.X, v.Resolution.Y))
+	for x := 0; x < v.Resolution.X; x++ {
+		for y := 0; y < v.Resolution.Y; y++ {
+			img.Set(x, y, color.Black)
+		}
+	}
+
+	max := args.MaxIter
+	resultChans := StartWork(v, max)
+
+	SetPixels(resultChans, img, v)
+
+	f, _ := os.Create(path)
+	err := png.Encode(f, img)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return v
+}
 
 func main() {
 	arg.MustParse(&args)
@@ -399,35 +288,20 @@ func main() {
 		log.Fatal(err)
 	}
 
-	GenerateImage(dst)
-}
+	view := GenerateImage(dst)
 
-func GenerateImage(path string) {
-	v := NewView(
-		image.Point{
-			X: args.PixelWidth,
-			Y: args.PixelHeight,
-		},
-		args.Height,
-		complex(args.CenterReal, args.CenterImag),
-	)
-	img := image.NewRGBA(image.Rect(0, 0, v.Resolution.X, v.Resolution.Y))
-	for x := 0; x < v.Resolution.X; x++ {
-		for y := 0; y < v.Resolution.Y; y++ {
-			img.Set(x, y, color.Black)
+	if args.Display >= 0 {
+		subprocessArgs := []string{dst}
+		if args.Display > 0 {
+			w, h := int(float64(args.Display)*view.Aspect), args.Display
+			subprocessArgs = []string{"-w", fmt.Sprint(w), "-h", fmt.Sprint(h), dst}
+		}
+
+		cmd := exec.Command("goiv", subprocessArgs...)
+		err := cmd.Run()
+		if err != nil {
+			return
 		}
 	}
-
-	max := args.MaxIter
-	resultChans := StartWork(v, max)
-
-	v.SetPixels(resultChans, img)
-
-	f, _ := os.Create(path)
-	err := png.Encode(f, img)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	log.Println("Done")
 }
