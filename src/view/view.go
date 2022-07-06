@@ -2,7 +2,7 @@ package view
 
 import (
 	"image"
-	"mandlebar/src/util"
+	"mandlebars/src/util"
 )
 
 type Side int
